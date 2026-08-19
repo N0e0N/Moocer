@@ -31,7 +31,30 @@ function createModel(purpose:"planning"|"narration"|"oralization"){
   if(!env.VOLCENGINE_API_KEY||!env.VOLCENGINE_LLM_MODEL)throw new Error("backend.env 中缺少火山方舟模型配置。");
   const thinkingEnabled=env.VOLCENGINE_THINKING!=="disabled";
   const model=purpose==="oralization"?(env.VOLCENGINE_NARRATION_MODEL||env.VOLCENGINE_LLM_MODEL):env.VOLCENGINE_LLM_MODEL;
-  return new ChatOpenAI({apiKey:env.VOLCENGINE_API_KEY,model,temperature:purpose==="oralization"?.65:.3,maxTokens:24000,modelKwargs:{thinking:{type:thinkingEnabled?"enabled":"disabled"}},configuration:{baseURL:(env.VOLCENGINE_BASE_URL||"").replace(/\/$/,"")}});
+  return new ChatOpenAI({apiKey:env.VOLCENGINE_API_KEY,model,temperature:purpose==="oralization"?.65:.3,maxTokens:24000,timeout:360000,modelKwargs:{thinking:{type:thinkingEnabled?"enabled":"disabled"}},configuration:{baseURL:(env.VOLCENGINE_BASE_URL||"").replace(/\/$/,"")}});
+}
+const MODEL_MAX_ATTEMPTS=3;
+const wait=(milliseconds:number)=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+function speakingCharsPerSecond(project:Project){
+  const speechRate=project.design?.voice.speechRate||0;
+  return Math.max(2.4,Math.min(7.2,4.8*(1+speechRate/100)));
+}
+function targetNarrationChars(project:Project){return Math.round(project.targetMinutes*60*speakingCharsPerSecond(project))}
+function modelErrorMessage(error:unknown){return error instanceof Error?error.message:String(error)}
+async function invokeWithModelRetry<T>(label:string,directory:string,invoke:()=>Promise<T>,onRetry?:(attempt:number,maxAttempts:number,error:string)=>Promise<void>){
+  let lastError:unknown;
+  for(let attempt=1;attempt<=MODEL_MAX_ATTEMPTS;attempt++){
+    try{return await invoke()}catch(error){
+      lastError=error;
+      const message=modelErrorMessage(error);
+      await fs.mkdir(directory,{recursive:true});
+      await fs.appendFile(path.join(directory,"model-attempts.jsonl"),`${JSON.stringify({label,attempt,maxAttempts:MODEL_MAX_ATTEMPTS,status:"failed",error:message,at:new Date().toISOString()})}\n`);
+      if(attempt===MODEL_MAX_ATTEMPTS)break;
+      if(onRetry)await onRetry(attempt+1,MODEL_MAX_ATTEMPTS,message);
+      await wait(attempt===1?1500:4000);
+    }
+  }
+  throw new Error(`${label}失败，已自动尝试 ${MODEL_MAX_ATTEMPTS} 次：${modelErrorMessage(lastError)}`);
 }
 const spokenChars=(text:string)=>(text.match(/[\u3400-\u9fffA-Za-z0-9]/g)||[]).length;
 const spokenDuration=(text:string)=>round(Math.max(2.5,spokenChars(text)/4.8));
@@ -105,7 +128,8 @@ export async function optimizeSlideNarration(project:Project,page:number,intent:
   const userPrompt=await renderPrompt("course-voice-revise.user.md",{PAGE:page,TITLE:slide.title,TEACHING_TASK:slide.teachingTask||"解释机制",RECORDING_DIRECTION:slide.recordingDirection||"",CURRENT_NARRATION:slide.narration,REVISION_INTENT:intent.trim()});
   const directory=path.join(path.dirname(project.outlinePath),"generation-input","revisions",`page-${String(page).padStart(2,"0")}`);await fs.mkdir(directory,{recursive:true});
   await Promise.all([fs.writeFile(path.join(directory,"system-prompt.md"),`${systemPrompt}\n`),fs.writeFile(path.join(directory,"user-prompt.md"),`${userPrompt}\n`)]);
-  const result=await createModel("oralization").withStructuredOutput(revisionSchema,{name:`revise_voiceover_page_${page}`}).invoke([{role:"system",content:systemPrompt},{role:"user",content:userPrompt}]);
+  const revisionModel=createModel("oralization").withStructuredOutput(revisionSchema,{name:`revise_voiceover_page_${page}`});
+  const result=await invokeWithModelRetry("本页口播优化",directory,()=>revisionModel.invoke([{role:"system",content:systemPrompt},{role:"user",content:userPrompt}]));
   const narration=result.narration.trim();if(!narration)throw new Error("优化结果为空，请换一种修改意图重试。");
   slide.narration=narration;const voice=refreshSlideVoicePrompt(slide,project.slides.findIndex(item=>item.page===page)+1);slide.audioPrompt=voice.audioPrompt;slide.plannedDurationSeconds=voice.plannedDurationSeconds;slide.audioOutdated=!!slide.aiAudioUrl||slide.audioSource==="ai"&&!!slide.audioUrl;
   const voicePage=project.voiceScript?.pages.find(item=>item.page===page);if(voicePage)voicePage.audio_prompt=voice.audioPrompt;
@@ -114,7 +138,8 @@ export async function optimizeSlideNarration(project:Project,page:number,intent:
   return project;
 }
 function buildArtifacts(project:Project,slides:Slide[]):{voiceScript:VoiceScript;playbackPlan:PlaybackPlan;slides:Slide[]}{
-  const role=`角色设定：高校课程讲师，30 岁左右的声音年龄感；声线沉静、清晰、有亲和力。目标语速每秒约 4.8 个汉字，讲述像带着学生共同观察画面；不使用背景音乐或夸张音效，术语与作品名清楚落点。课程受众：${project.audience}。讲述风格：${project.style}`;
+  const persona=project.design?.voice?.role?.trim()||"35至45岁、有经验的大学讲师。普通话清晰，语速约每秒4.8个汉字，语气平静、温和、有教学现场感。不加背景音乐和音效";
+  const role=`角色设定：${persona}。讲述像带着学生共同观察画面，术语与作品名清楚落点。课程受众：${project.audience}。讲述风格：${project.style}`;
   const lines=slides.map((slide,index)=>({...slide,id:index+1,duration:lineDuration(slide.narration||""),isTransition:slide.type==="transition"||slide.teachingTask==="转场"}));
   const timeline:VoiceScript["timeline"]=[],generation_batches:VoiceScript["generation_batches"]=[],voicePages:VoiceScript["pages"]=[];
   for(const line of lines){
@@ -134,9 +159,9 @@ export async function writeNarrations(project:Project){
   const projectDirectory=path.dirname(project.outlinePath);
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"preparing",label:"正在检查课件截图",percent:2,completedPages:0,totalPages:project.slides.length});
   await ensureProjectThumbnails(project);
-  const outline=(await fs.readFile(project.outlinePath,"utf8")).slice(0,40000),targetChars=Math.round(project.targetMinutes*60*4.8),pages=project.slides.map(slide=>pageInput(project,slide));
+  const outline=(await fs.readFile(project.outlinePath,"utf8")).slice(0,40000),targetChars=targetNarrationChars(project),pages=project.slides.map(slide=>pageInput(project,slide));
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"planning",label:"正在根据课纲规划章节与口播结构",percent:6,completedPages:0,totalPages:pages.length});
-  const voicePlan=await createVoicePlan(model,project,outline,pages,targetChars),generated: z.infer<typeof generatedSlide>[]=[];
+  const voicePlan=project.voicePlan||await createVoicePlan(model,project,outline,pages,targetChars),generated: z.infer<typeof generatedSlide>[]=[];
   const chapterBatches=buildChapterBatches(voicePlan,pages),totalBatches=chapterBatches.length;
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"planning",label:`章节规划已完成，共 ${totalBatches} 个章节`,percent:12,completedPages:0,totalPages:pages.length,totalBatches});
   for(const [batchIndex,chapter] of chapterBatches.entries()){
@@ -157,7 +182,7 @@ export async function writeNarrations(project:Project){
 }
 
 export async function planNarrations(project:Project){
-  const projectDirectory=path.dirname(project.outlinePath),outline=(await fs.readFile(project.outlinePath,"utf8")).slice(0,40000),pages=project.slides.map(slide=>pageInput(project,slide)),targetChars=Math.round(project.targetMinutes*60*4.8);
+  const projectDirectory=path.dirname(project.outlinePath),outline=(await fs.readFile(project.outlinePath,"utf8")).slice(0,40000),pages=project.slides.map(slide=>pageInput(project,slide)),targetChars=targetNarrationChars(project);
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"planning",label:"正在根据课纲规划章节",percent:25,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:pages.length});
   const model=createModel("planning");
   const voicePlan=await createVoicePlan(model,project,outline,pages,targetChars);
@@ -169,7 +194,7 @@ export async function writeNarrationChapter(project:Project,sectionIndex:number)
   if(!project.voicePlan)throw new Error("请先生成章节规划。");
   const sections=[...project.voicePlan.sections].sort((a,b)=>a.startPage-b.startPage),section=sections[sectionIndex];
   if(!section)throw new Error("没有找到要生成的章节。");
-  const projectDirectory=path.dirname(project.outlinePath),pages=project.slides.map(slide=>pageInput(project,slide)),batchPages=pages.filter(page=>page.page>=section.startPage&&page.page<=section.endPage),targetChars=Math.round(project.targetMinutes*60*4.8);
+  const projectDirectory=path.dirname(project.outlinePath),pages=project.slides.map(slide=>pageInput(project,slide)),batchPages=pages.filter(page=>page.page>=section.startPage&&page.page<=section.endPage),targetChars=targetNarrationChars(project);
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"preparing",label:`正在准备：${section.title}`,percent:5,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:project.slides.length,currentBatch:sectionIndex+1,totalBatches:sections.length,range:`${section.startPage}-${section.endPage}`});
   await ensureProjectThumbnails(project);
   await writeGenerationProgress(projectDirectory,{status:"running",phase:"batching",label:`正在撰写：${section.title}`,percent:35,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:project.slides.length,currentBatch:sectionIndex+1,totalBatches:sections.length,range:`${section.startPage}-${section.endPage}`});
@@ -187,13 +212,17 @@ export async function writeNarrationChapter(project:Project,sectionIndex:number)
 type PageInput={page:number;title:string;type:Slide["type"];assets:MediaPage["assets"];animations:MediaPage["animations"];watchSeconds:number};
 function pageInput(project:Project,slide:Slide):PageInput{const media=project.mediaManifest?.pages.find(page=>page.page===slide.page);return {page:slide.page,title:slide.title,type:slide.type,assets:media?.assets||[],animations:media?.animations||[],watchSeconds:media?.watch_seconds||0}}
 async function createVoicePlan(model:ChatOpenAI,project:Project,outline:string,pages:PageInput[],targetChars:number):Promise<VoicePlan>{
-  const systemPrompt=await renderPrompt("course-voice-plan.system.md",{TARGET_MINUTES:project.targetMinutes,TARGET_CHARS:targetChars,AUDIENCE:project.audience,STYLE:project.style,PAGE_COUNT:pages.length});
+  const voice=project.design?.voice;
+  const systemPrompt=await renderPrompt("course-voice-plan.system.md",{TARGET_MINUTES:project.targetMinutes,TARGET_CHARS:targetChars,AUDIENCE:project.audience,STYLE:project.style,PAGE_COUNT:pages.length,VOICE_ROLE:voice?.role||"系统默认大学讲师",SPEAKER_ID:voice?.speakerId||"系统默认音色",SPEECH_RATE:voice?.speechRate||0,PITCH_RATE:voice?.pitchRate||0,LOUDNESS_RATE:voice?.loudnessRate||0,SPEAKING_CHARS_PER_SECOND:speakingCharsPerSecond(project).toFixed(2)});
   const userPrompt=await renderPrompt("course-voice-plan.user.md",{OUTLINE:outline,PAGE_COUNT:pages.length});
   const directory=path.join(path.dirname(project.outlinePath),"generation-input","plan");await fs.mkdir(directory,{recursive:true});
   await Promise.all([fs.writeFile(path.join(directory,"system-prompt.md"),`${systemPrompt}\n`),fs.writeFile(path.join(directory,"user-prompt.md"),`${userPrompt}\n`)]);
-  const plan=await model.withStructuredOutput(planSchema,{name:"course_voiceover_plan"}).invoke([{role:"system",content:systemPrompt},{role:"user",content:userPrompt}]);
-  const plannedPages=new Set(plan.pages.map(page=>page.page));if(plan.pages.length!==pages.length||pages.some(page=>!plannedPages.has(page.page)))throw new Error(`口播规划页数不完整：应为 ${pages.length} 页，实际为 ${plan.pages.length} 页。`);
-  validateSections(plan,pages.length);
+  const planner=model.withStructuredOutput(planSchema,{name:"course_voiceover_plan"});
+  const plan=await invokeWithModelRetry("口播规划模型调用",directory,async()=>{
+    const candidate=await planner.invoke([{role:"system",content:systemPrompt},{role:"user",content:userPrompt}]);
+    const plannedPages=new Set(candidate.pages.map(page=>page.page));if(candidate.pages.length!==pages.length||pages.some(page=>!plannedPages.has(page.page)))throw new Error(`口播规划页数不完整：应为 ${pages.length} 页，实际为 ${candidate.pages.length} 页。`);
+    validateSections(candidate,pages.length);return candidate;
+  },async(attempt,maxAttempts)=>writeGenerationProgress(path.dirname(project.outlinePath),{status:"running",phase:"planning",label:`规划模型响应异常，正在自动重试 ${attempt}/${maxAttempts}`,percent:25,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:pages.length}));
   await fs.writeFile(path.join(directory,"voice-plan.json"),`${JSON.stringify(plan,null,2)}\n`);return plan;
 }
 async function createNarrationBatch(model:ChatOpenAI,project:Project,voicePlan:VoicePlan,batchPages:PageInput[],previous:z.infer<typeof generatedSlide>[],targetChars:number,batchNumber:number,chapterTitle:string,onDraftReady?:()=>Promise<void>){
@@ -205,8 +234,12 @@ async function createNarrationBatch(model:ChatOpenAI,project:Project,voicePlan:V
   for(const page of batchPages){const thumbnail=path.join(path.dirname(project.outlinePath),"thumbnails",`slide-${String(page.page).padStart(2,"0")}.jpg`),image=await fs.readFile(thumbnail);content.push({type:"text",text:`\n以下图片是第 ${page.page} 页真实课件截图：`},{type:"image_url",image_url:{url:`data:image/jpeg;base64,${image.toString("base64")}`,detail:"high"}})}
   const directory=path.join(path.dirname(project.outlinePath),"generation-input",`chapter-${String(batchNumber).padStart(2,"0")}`);await fs.mkdir(directory,{recursive:true});
   await Promise.all([fs.writeFile(path.join(directory,"system-prompt.md"),`${systemPrompt}\n`),fs.writeFile(path.join(directory,"user-prompt.md"),`${userPrompt}\n`),fs.writeFile(path.join(directory,"screenshots.json"),`${JSON.stringify(batchPages.map(page=>({page:page.page,file:`../../thumbnails/slide-${String(page.page).padStart(2,"0")}.jpg`})),null,2)}\n`)]);
-  const result=await model.withStructuredOutput(schema,{name:`course_voiceover_batch_${range}`}).invoke([{role:"system",content:systemPrompt},new HumanMessage({content})]);
-  const returned=new Set(result.slides.map(slide=>slide.page));if(result.slides.length!==batchPages.length||pageNumbers.some(page=>!returned.has(page))||result.slides.some(slide=>!pageNumbers.includes(slide.page)))throw new Error(`第 ${range} 页批次返回不完整或包含越界页码。`);
+  const drafter=model.withStructuredOutput(schema,{name:`course_voiceover_batch_${range}`});
+  const result=await invokeWithModelRetry(`第 ${range} 页口播初稿模型调用`,directory,async()=>{
+    const candidate=await drafter.invoke([{role:"system",content:systemPrompt},new HumanMessage({content})]);
+    const returned=new Set(candidate.slides.map(slide=>slide.page));if(candidate.slides.length!==batchPages.length||pageNumbers.some(page=>!returned.has(page))||candidate.slides.some(slide=>!pageNumbers.includes(slide.page)))throw new Error(`第 ${range} 页批次返回不完整或包含越界页码。`);
+    return candidate;
+  },async(attempt,maxAttempts)=>writeGenerationProgress(path.dirname(project.outlinePath),{status:"running",phase:"batching",label:`第 ${range} 页模型响应异常，正在自动重试 ${attempt}/${maxAttempts}`,percent:35,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:project.slides.length,currentBatch:batchNumber,totalBatches:voicePlan.sections.length,range}));
   const orderedDrafts=result.slides.sort((a,b)=>a.page-b.page);
   await fs.writeFile(path.join(directory,"draft-result.json"),`${JSON.stringify({slides:orderedDrafts},null,2)}\n`);
   if(onDraftReady)await onDraftReady();
@@ -219,7 +252,12 @@ async function createNarrationBatch(model:ChatOpenAI,project:Project,voicePlan:V
   ]);
   const oralizationModel=createModel("oralization");
   const oralizer=oralizationModel.withStructuredOutput(schema,{name:`course_voiceover_oralized_${range}`});
-  let oralizedResult=await oralizer.invoke([{role:"system",content:oralizeSystemPrompt},{role:"user",content:oralizeUserPrompt}]);
+  const invokeOralizer=(prompt:string)=>invokeWithModelRetry(`第 ${range} 页口语化模型调用`,directory,async()=>{
+    const candidate=await oralizer.invoke([{role:"system",content:oralizeSystemPrompt},{role:"user",content:prompt}]);
+    const returned=new Set(candidate.slides.map(slide=>slide.page));if(candidate.slides.length!==orderedDrafts.length||pageNumbers.some(page=>!returned.has(page))||candidate.slides.some(slide=>!pageNumbers.includes(slide.page)))throw new Error(`第 ${range} 页口语化改写返回不完整或包含越界页码。`);
+    return candidate;
+  },async(attempt,maxAttempts)=>writeGenerationProgress(path.dirname(project.outlinePath),{status:"running",phase:"oralizing",label:`第 ${range} 页口语化响应异常，正在自动重试 ${attempt}/${maxAttempts}`,percent:68,completedPages:project.slides.filter(slide=>slide.narration).length,totalPages:project.slides.length,currentBatch:batchNumber,totalBatches:voicePlan.sections.length,range}));
+  let oralizedResult=await invokeOralizer(oralizeUserPrompt);
   const draftMap=new Map(orderedDrafts.map(slide=>[slide.page,slide]));
   const changedEnough=(slides:z.infer<typeof generatedSlide>[])=>{
     const substantive=slides.filter(slide=>spokenChars(draftMap.get(slide.page)?.narration||"")>=40);
@@ -228,11 +266,9 @@ async function createNarrationBatch(model:ChatOpenAI,project:Project,voicePlan:V
   if(!changedEnough(oralizedResult.slides)){
     const retryPrompt=`${oralizeUserPrompt}\n\n# 强化改写要求\n\n上一版与初稿过于相似，不能通过口语化检查。请重新改写：每个非转场内容页至少完成两类可观察转换，包括重组书面句序、补足自然承接、把抽象名词改成直接动词、把静态说明改成共同观察、为术语加入不新增事实的白话解释、合并清单式短句。不能只删除虚词或替换一两个词，也不能原样返回；保持事实与页面字段不变。`;
     await fs.writeFile(path.join(directory,"oralize-user-prompt-retry.md"),`${retryPrompt}\n`);
-    oralizedResult=await oralizer.invoke([{role:"system",content:oralizeSystemPrompt},{role:"user",content:retryPrompt}]);
-    if(!changedEnough(oralizedResult.slides))throw new Error(`第 ${range} 页口语化改写与初稿仍过于相似，请重新生成本章。`);
+    oralizedResult=await invokeOralizer(retryPrompt);
+    if(!changedEnough(oralizedResult.slides))await fs.writeFile(path.join(directory,"oralize-low-change-result.json"),`${JSON.stringify({warning:"口语化改写幅度低于建议值，已保留结构完整的改写结果。",slides:oralizedResult.slides},null,2)}\n`);
   }
-  const oralizedReturned=new Set(oralizedResult.slides.map(slide=>slide.page));
-  if(oralizedResult.slides.length!==orderedDrafts.length||pageNumbers.some(page=>!oralizedReturned.has(page))||oralizedResult.slides.some(slide=>!pageNumbers.includes(slide.page)))throw new Error(`第 ${range} 页口语化改写返回不完整或包含越界页码。`);
   const oralizedMap=new Map(oralizedResult.slides.map(slide=>[slide.page,slide]));
   const oralizedDrafts=orderedDrafts.map(draft=>{
     const oralized=oralizedMap.get(draft.page);
@@ -282,7 +318,7 @@ async function saveDraftCheckpoint(project:Project,voicePlan:VoicePlan,slides:z.
 export async function prepareVoicePrompts(project:Project,outline?:string,pages?:Array<{page:number;title:string;text:string;type:Slide["type"];assets:unknown[]}>,targetChars?:number){
   const actualOutline=outline??(await fs.readFile(project.outlinePath,"utf8")).slice(0,40000);
   const actualPages=pages??project.slides.map(slide=>({page:slide.page,title:slide.title,text:slide.text.slice(0,2200),type:slide.type,assets:project.mediaManifest?.pages.find(page=>page.page===slide.page)?.assets||[]}));
-  const actualTargetChars=targetChars??Math.round(project.targetMinutes*60*4.8);
+  const actualTargetChars=targetChars??targetNarrationChars(project);
   const systemPrompt=await renderPrompt("course-voice-script.system.md",{TARGET_MINUTES:project.targetMinutes,TARGET_CHARS:actualTargetChars,AUDIENCE:project.audience,STYLE:project.style,PAGE_SCOPE_RULE:"必须完整返回课件中的每一页，页码不得缺失、重复或重新排序。",PAGE_COMPLETENESS_RULE:"返回页数与输入页面总数完全一致，页码连续对应，无遗漏、无重复。"});
   const userPrompt=await renderPrompt("course-voice-script.user.md",{OUTLINE:actualOutline,PAGES_JSON:JSON.stringify(actualPages,null,2),PAGE_COUNT:actualPages.length});
   const promptSnapshotDir=path.join(path.dirname(project.outlinePath),"generation-input");

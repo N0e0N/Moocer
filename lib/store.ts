@@ -6,13 +6,14 @@ import { probe } from "./media";
 const root=path.resolve(process.cwd(),"data/projects");
 export async function projectDir(id:string){ const dir=path.join(root,id); await fs.mkdir(dir,{recursive:true}); return dir; }
 const toStoredPath=(value:string|undefined)=>value&&path.isAbsolute(value)?path.relative(process.cwd(),value):value;
-const toRuntimePath=(value:string|undefined)=>value&&!path.isAbsolute(value)?path.resolve(process.cwd(),value):value;
+const toRuntimePath=(value:string|undefined)=>value&&!path.isAbsolute(value)?path.resolve(/* turbopackIgnore: true */ process.cwd(),value):value;
 function storedProject(project:Project):Project{
   return {
     ...project,
     sourcePath:toStoredPath(project.sourcePath)!,
     outlinePath:toStoredPath(project.outlinePath)!,
     videoPath:toStoredPath(project.videoPath),
+    videoVersions:project.videoVersions?.map(version=>({...version,path:toStoredPath(version.path)})),
     slides:project.slides.map(slide=>({...slide,audioPath:toStoredPath(slide.audioPath),aiAudioPath:toStoredPath(slide.aiAudioPath),recordingAudioPath:toStoredPath(slide.recordingAudioPath),recordingOriginalPath:toStoredPath(slide.recordingOriginalPath)})),
     mediaManifest:project.mediaManifest?{...project.mediaManifest,source:toStoredPath(project.mediaManifest.source)!}:undefined
   };
@@ -21,6 +22,7 @@ function runtimeProject(project:Project):Project{
   project.sourcePath=toRuntimePath(project.sourcePath)!;
   project.outlinePath=toRuntimePath(project.outlinePath)!;
   project.videoPath=toRuntimePath(project.videoPath);
+  if(project.videoVersions)project.videoVersions=project.videoVersions.map(version=>({...version,path:toRuntimePath(version.path)}));
   for(const slide of project.slides){slide.audioPath=toRuntimePath(slide.audioPath);slide.aiAudioPath=toRuntimePath(slide.aiAudioPath);slide.recordingAudioPath=toRuntimePath(slide.recordingAudioPath);slide.recordingOriginalPath=toRuntimePath(slide.recordingOriginalPath)}
   if(project.mediaManifest)project.mediaManifest.source=toRuntimePath(project.mediaManifest.source)!;
   return project;
@@ -53,6 +55,7 @@ async function migrateProjectPaths(project:Project){
   project.sourcePath=update(project.sourcePath)!;
   project.outlinePath=update(project.outlinePath)!;
   project.videoPath=update(project.videoPath);
+  if(project.videoVersions)project.videoVersions=project.videoVersions.map(version=>({...version,path:update(version.path)}));
   for(const slide of project.slides){
     slide.audioPath=update(slide.audioPath);
     slide.aiAudioPath=update(slide.aiAudioPath);
@@ -76,7 +79,7 @@ async function migrateProjectPaths(project:Project){
 
 export async function getProject(id:string){
   const stored=JSON.parse(await fs.readFile(path.join(root,id,"project.json"),"utf8")) as Project;
-  const hadAbsolutePaths=[stored.sourcePath,stored.outlinePath,stored.videoPath,stored.mediaManifest?.source,...stored.slides.flatMap(slide=>[slide.audioPath,slide.aiAudioPath,slide.recordingAudioPath,slide.recordingOriginalPath])].some(value=>value&&path.isAbsolute(value));
+  const hadAbsolutePaths=[stored.sourcePath,stored.outlinePath,stored.videoPath,...(stored.videoVersions||[]).map(version=>version.path),stored.mediaManifest?.source,...stored.slides.flatMap(slide=>[slide.audioPath,slide.aiAudioPath,slide.recordingAudioPath,slide.recordingOriginalPath])].some(value=>value&&path.isAbsolute(value));
   const project=runtimeProject(stored);
   if(await migrateProjectPaths(project)||hadAbsolutePaths)await saveProject(project);
   return project;
@@ -86,4 +89,4 @@ export async function listProjects(){
   for(const entry of entries){if(!entry.isDirectory())continue;try{projects.push(await getProject(entry.name))}catch{continue}}
   return projects.sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
 }
-export function publicProject(project:Project){ return {...project,sourceFile:project.sourceFile||path.basename(project.sourcePath),sourcePath:undefined,outlinePath:undefined,videoPath:undefined,slides:project.slides.map(s=>({...s,audioPath:undefined,aiAudioPath:undefined,recordingAudioPath:undefined,recordingOriginalPath:undefined}))}; }
+export function publicProject(project:Project){ return {...project,sourceFile:project.sourceFile||path.basename(project.sourcePath),sourcePath:undefined,outlinePath:undefined,videoPath:undefined,videoVersions:project.videoVersions?.map(version=>({...version,path:undefined})),slides:project.slides.map(s=>({...s,audioPath:undefined,aiAudioPath:undefined,recordingAudioPath:undefined,recordingOriginalPath:undefined}))}; }

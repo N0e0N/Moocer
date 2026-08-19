@@ -37,7 +37,7 @@ type RenderManifest={
   }>;
 };
 export type RenderVideoOptions={startPage?:number;endPage?:number};
-export type RenderVideoResult={output:string;startPage:number;endPage:number;fullCourse:boolean};
+export type RenderVideoResult={output:string;startPage:number;endPage:number;fullCourse:boolean;durationSeconds:number};
 
 async function fileReady(file:string){try{return (await fs.stat(file)).size>1024}catch{return false}}
 async function loadManifest(file:string):Promise<RenderManifest>{
@@ -92,5 +92,5 @@ export async function renderVideo(project:Project,projectDirectory:string,option
   const fullCourse=startPage===firstPage&&endPage===lastPage,rangeName=`${String(startPage).padStart(2,"0")}-${String(endPage).padStart(2,"0")}`,concatFile=path.join(videoDirectory,`concat-${rangeName}.txt`);await fs.writeFile(concatFile,pages.map(page=>`file '${escapeConcatPath(page.segmentPath)}'`).join("\n"),"utf8");
   const output=path.join(projectDirectory,fullCourse?"course.mp4":`course-pages-${rangeName}.mp4`);await run("ffmpeg",["-y","-f","concat","-safe","0","-i",concatFile,"-c","copy","-movflags","+faststart",output]);
   await writeVideoProgress(projectDirectory,{status:"complete",phase:"complete",label:`第 ${startPage}–${endPage} 页 MP4 已导出`,percent:100,completedPages:pages.length,totalPages:pages.length,range:`${startPage}–${endPage}`});
-  return {output,startPage,endPage,fullCourse};
+  return {output,startPage,endPage,fullCourse,durationSeconds:round(pages.reduce((total,page)=>total+page.duration,0))};
 }
