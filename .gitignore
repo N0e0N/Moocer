@@ -41,8 +41,11 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
-/data/projects/
-/data/archive/
+/data/
+/exports/
+/recordings/
+/.qa-*
+/design-qa.md
 /tsconfig.tsbuildinfo
 
 # workbuddy workspace metadata (not part of the repo)

@@ -47,7 +47,7 @@ export async function POST(request:Request,{params}:{params:Promise<{id:string}>
     for(const [index,slide] of targets.entries()){
       await writeAudioProgress(directory,{status:"running",phase:"audio",label:`正在生成第 ${slide.page} 页 MP3`,percent:Math.round((index/totalPages)*100),completedPages:index,totalPages,currentPage:slide.page});
       const fileName=`page-${String(slide.page).padStart(2,"0")}.mp3`,output=path.join(audioDirectory,fileName);
-      const duration=await synthesize(slide.narration!,output,slide.recordingDirection);
+      const duration=await synthesize(slide.narration!,output,slide.recordingDirection,project.design?.voice);
       const url=`/api/files/${id}/audio/${fileName}?v=${Date.now()}`;
       slide.aiAudioPath=output;slide.aiAudioUrl=url;slide.aiDurationSeconds=duration;slide.aiNormalized=true;
       slide.audioPath=output;slide.audioUrl=url;slide.durationSeconds=duration;slide.audioSource="ai";slide.audioOutdated=false;
